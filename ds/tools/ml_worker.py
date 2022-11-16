@@ -1,16 +1,22 @@
 import traceback
 import pandas as pd
 from sqlalchemy import create_engine
-from tqdm import tqdm
 from time import sleep
 import uuid
 
+
+
 class PostgresMeta:
+    
+    engine = None
 
     def __init__(self, conn):
         self.conn = conn
-        self.engine = create_engine(self.conn, 
+        if PostgresMeta.engine is None:
+            PostgresMeta.engine = create_engine(self.conn, 
                                     isolation_level = "REPEATABLE READ")
+        self.engine = PostgresMeta.engine
+        
         
     def get_table_cols(self, table):
         result = pd.read_sql(f"SELECT * FROM information_schema.columns WHERE table_name='{table}'", con=self.conn)
@@ -72,7 +78,7 @@ class DBTracker:
         
     def check(self):
         new_recs = pd.read_sql(f"SELECT * FROM {self.table} WHERE {self.track_col} != {self.ts_col} OR {self.track_col} is NULL", con=self.conn)
-        for _, rec in tqdm(new_recs.iterrows()):
+        for _, rec in new_recs.iterrows():
             if self._notify(rec): 
                 self.mark(rec[self.uuid_col])
     
@@ -90,14 +96,25 @@ import hnswlib
 
 
 
-def combine(*vecs):
+def combine(vecs, norm='l2'):
     rs = torch.zeros(768)
     n = 0
-    for v in vecs:
+    for v, w in vecs.items():
         if not v is None and v == v:
-            rs += word2vec(v)
-            n  += 1
-    return rs / n if n > 0 else rs
+            rs += word2vec(v) * w
+            n  += w
+    #rs = rs / n if n > 0 else rs
+    rs = rs / torch.sum(rs * rs)
+    return rs
+
+# def get_usr_liked(uid, con):
+#     likes = pd.read_sql_query("select * from likes where author_uuid='%s'" % uid , con=con)
+#     return likes
+
+def get_usr_liked(uid, con):
+    likes = pd.read_sql_query(
+        "select * from ideas ii join likes ll on ii.uuid=ll.idea_uuid where ll.author_uuid='%s' order by ll.created_at desc" % uid , con=con)
+    return likes.drop_duplicates()
 
 
 def get_usr_by_uid(uid, con):
@@ -146,47 +163,70 @@ class ML_Ideas_Feeder_Baseline():
         self.idx.init_index(max_elements = n_max_items, ef_construction = 200, M = 16)
         self.uuids = {}
         self.feeder = FeedRefresher(conn, 'likes_advices', 'user_uuid', 'idea_uuid')
+        self.categories = pd.read_sql("select uuid, name from idea_categories", con=conn)
+        self.categories.set_index("uuid", inplace=True)
         
+    def category_to_text(self, cat_id):
+        if not cat_id is None:
+            return self.categories.loc[cat_id, "name"]
         
     def __update_ideas_index(self, idea):
-        vec = combine(idea["name"], idea.description)
+        vec = combine({idea["name"]:1, idea.description:1, self.category_to_text(idea.category_uuid):5})
         self.uuids[self.idx.element_count] = idea["uuid"]
         self.idx.add_items(vec)
-        
     
+    # def __handle_user_like(self, like):
+    #     # get_usr_by_uid(like.author_uuid)
+    #     if like.is_positive:
+    #         author_uuid = like.author_uuid
+    #         idea = get_idea_by_uid(like.idea_uuid, self.conn)
+    #         query = combine(idea["name"], idea.description)
+    #         labels, distances = self.idx.knn_query(query)
+    #         self.feeder.clear_for_user(author_uuid)
+    #         new = [self.uuids[s] for s in labels.reshape(-1)]
+    #         distances  = distances.reshape(-1)
+    #         print(new)
+    #         raise 1
+    #         for idea_uuid, d in zip(new, distances):
+    #             print("updating: ", idea_uuid)
+    #             self.feeder.put_new_item(author_uuid, idea_uuid, 1 - d)
     
-    def __handle_user_like(self, like):
+    def __handle_user_like(self, like, top_k=5):
+        print("Got like: ", like)
         # get_usr_by_uid(like.author_uuid)
-        if like.is_positive:
-            author_uuid = like.author_uuid
-            idea = get_idea_by_uid(like.idea_uuid, self.conn)
-            query = combine(idea["name"], idea.description)
-            labels, distances = self.idx.knn_query(query)
-            self.feeder.clear_for_user(author_uuid)
-            new = [self.uuids[s] for s in labels.reshape(-1)]
-            distances  = distances.reshape(-1)
-            print(new)
-            raise 1
-            for idea_uuid, d in zip(new, distances):
-                print("updating: ", idea_uuid)
-                self.feeder.put_new_item(author_uuid, idea_uuid, 1 - d)
-            
-        
+        liked_ideas = get_usr_liked(like.author_uuid, con=self.conn)
+        candidates = []
+        for _, idea  in liked_ideas.head(top_k).iterrows():
+            query = combine({idea["name"]:1, idea.description:1, self.category_to_text(idea.category_uuid):5})
+            labels, distances = self.idx.knn_query(query, 10)
+            labels = [self.uuids[s] for s in labels.reshape(-1)]
+            sign = 1 if idea.is_positive else -1
+            similarity = (1. - distances.reshape(-1)) * sign
+            candidates += [ pd.DataFrame({"idea_uuid":labels, "level":similarity})]
+
+        candidates = pd.concat(candidates)
+        candidates = candidates.groupby("idea_uuid")["level"].mean()
+        self.feeder.clear_for_user(like.author_uuid)
+        for idea_uuid, level in candidates.iteritems():
+            self.feeder.put_new_item(like.author_uuid, idea_uuid, level * 100)
         
         
     def start(self):
+        
+        
         self.ideas_tracker = DBTracker(self.conn, "ideas", "uuid", "updated_at")
         self.ideas_tracker.reset()
         self.ideas_tracker.add_handler(self.__update_ideas_index)
         self.ideas_tracker.attach()
         
         self.likes_tracker = DBTracker(self.conn, "likes", "uuid", "updated_at")
+        self.likes_tracker.attach()
         self.likes_tracker.add_handler(self.__handle_user_like)
         
-        # while True: 
-        #    sleep(2)
-        self.ideas_tracker.check()
-        self.likes_tracker.check()
+        while True: 
+            sleep(2)
+            self.ideas_tracker.check()
+            self.likes_tracker.check()
         
         
         
